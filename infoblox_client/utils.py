@@ -30,6 +30,9 @@ LOG = logging.getLogger(__name__)
 
 
 def is_valid_ip(ip):
+    """Check if the given IP address is valid."""
+    if ip is None:
+        return False
     try:
         netaddr.IPAddress(ip)
     except netaddr.core.AddrFormatError:
