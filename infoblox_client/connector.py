@@ -19,6 +19,7 @@ import urllib
 import requests
 import six
 import urllib3
+import time
 from requests import exceptions as req_exc
 
 try:
@@ -59,6 +60,26 @@ def reraise_neutron_exception(func):
     return callee
 
 
+def retry_on_expired_cookie(func):
+    """Decorator to handle expired cookies by re-authenticating and retrying the request."""
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except (req_exc.HTTPError, ib_ex.InfobloxBadWAPICredential) as e:
+            if isinstance(e, req_exc.HTTPError) and e.response.status_code == requests.codes.UNAUTHORIZED:
+                LOG.info("Bad WAPI credentials or Cookie timeout. Re-authenticating and retrying the request.")
+            elif isinstance(e, ib_ex.InfobloxBadWAPICredential):
+                LOG.info("Bad WAPI credentials or Cookie timeout. Re-authenticating and retrying the request.")
+            else:
+                raise
+
+            self.session.cookies.clear()
+            self.session.auth = (self.username, self.password)
+            return func(self, *args, **kwargs)
+    return wrapper
+
+
 class Connector(object):
     """Connector stands for interacting with Infoblox NIOS
 
@@ -92,7 +113,7 @@ class Connector(object):
             self._urljoin = urlparse.urljoin
 
     def _parse_options(self, options):
-        """Copy needed options to self"""
+        """Copy necessary options to self"""
         attributes = ('host', 'wapi_version', 'username', 'password',
                       'cert', 'key', 'ssl_verify', 'http_request_timeout',
                       'max_retries', 'http_pool_connections',
@@ -207,6 +228,7 @@ class Connector(object):
     @staticmethod
     def _validate_authorized(response):
         if response.status_code == requests.codes.UNAUTHORIZED:
+            LOG.debug("WAPI Response: %s", response.content)
             raise ib_ex.InfobloxBadWAPICredential(response='')
 
     @staticmethod
@@ -233,6 +255,32 @@ class Connector(object):
 
         return query_params
 
+    def is_cookie_expired(self):
+        cookie_jar = self.session.cookies
+        for cookie in cookie_jar:
+            if cookie.name == 'ibapauth':
+                # Parse the cookie value
+                cookie_value = cookie.value.strip('"')
+                cookie_parts = {}
+                for part in cookie_value.split(','):
+                    if '=' in part:
+                        key, value = part.split('=', 1)
+                        cookie_parts[key] = value
+
+                # Extract ctime and timeout
+                ctime = int(cookie_parts.get('ctime', 0))
+                timeout = int(cookie_parts.get('timeout', 0))
+
+                # Calculate expiration time
+                expiration_time = ctime + timeout
+
+                # Get current time
+                current_time = int(time.time())
+
+                # Check if the cookie is expired
+                return current_time > expiration_time
+        return True  # If the cookie is not found, consider it expired
+
     def _get_request_options(self, data=None):
         opts = dict(timeout=self.http_request_timeout,
                     headers=self.DEFAULT_HEADER,
@@ -240,6 +288,15 @@ class Connector(object):
         if data:
             opts['data'] = jsonutils.dumps(data)
         return opts
+
+    def _validate_cookie(self):
+        if self.is_cookie_expired():
+            LOG.info("Cookie expired. Clearing cookies and re-authenticating on the next request.")
+            self.session.cookies.clear()
+            self.session.auth = (self.username, self.password)
+        else:
+            LOG.info("Subsequent calls will use the existing cookie for authentication")
+            self.session.auth = None  # Do not re-authenticate
 
     @staticmethod
     def _parse_reply(request):
@@ -261,6 +318,7 @@ class Connector(object):
             LOG.debug(*message)
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def get_object(self, obj_type, payload=None, return_fields=None,
                    extattrs=None, force_proxy=False, max_results=None,
                    paging=None):
@@ -269,7 +327,7 @@ class Connector(object):
         Some get requests like 'ipv4address' should be always
         proxied to GM on Hellfire
         If request is cloud and proxy is not forced yet,
-        then plan to do 2 request:
+        then plan to do two requests:
         - the first one is not proxied to GM
         - the second is proxied to GM
 
@@ -282,13 +340,13 @@ class Connector(object):
             force_proxy   (bool): Set _proxy_search flag
                                   to process requests on GM
             max_results   (int): Maximum number of objects to be returned.
-                If set to a negative number the appliance will return an error
+                If set to a negative number, the appliance will return an error
                 when the number of returned objects would exceed the setting.
                 The default is -1000. If this is set to a positive number,
                 the results will be truncated when necessary.
-            paging    (bool): Enables paging to wapi calls if paging = True,
+            Paging (bool): Enables paging to wapi calls if paging = True,
                 it uses _max_results to set paging size of the wapi calls.
-                If _max_results is negative it will take paging size as 1000.
+                If _max_results is negative, it will take paging size as 1000.
 
         Returns:
             A list of the Infoblox objects requested
@@ -359,7 +417,7 @@ class Connector(object):
         if self.session.cookies:
             # the first 'get' or 'post' action will generate a cookie
             # after that, we don't need to re-authenticate
-            self.session.auth = None
+            self._validate_cookie()
         r = self.session.get(url, **opts)
 
         self._validate_authorized(r)
@@ -371,7 +429,9 @@ class Connector(object):
         return self._parse_reply(r)
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def download_file(self, url):
+        self._validate_cookie()
         if self.session.cookies:
             self.session.auth = None
         ibapauth_cookie = self.session.cookies.get('ibapauth')
@@ -388,6 +448,7 @@ class Connector(object):
         return r
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def upload_file(self, url, files):
         """Upload file to fully-qualified upload url
 
@@ -400,8 +461,10 @@ class Connector(object):
             InfobloxException
         """
         if self.session.cookies:
-            self.session.auth = None
-        r = self.session.post(url, files=files)
+            self._validate_cookie()
+        ibapauth_cookie = self.session.cookies.get('ibapauth')
+        req_cookies = {'ibapauth': ibapauth_cookie}
+        r = self.session.post(url, files=files, cookies=req_cookies)
         if r.status_code != requests.codes.ok:
             response = utils.safe_json_load(r.content)
             raise ib_ex.InfobloxFileUploadFailed(
@@ -414,16 +477,17 @@ class Connector(object):
         return r
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def create_object(self, obj_type, payload, return_fields=None):
         """Create an Infoblox object of type 'obj_type'
 
         Args:
-            obj_type        (str): Infoblox object type,
-                                  e.g. 'network', 'range', etc.
-            payload       (dict): Payload with data to send
+            obj_type (str): Infoblox object type,
+                            e.g. 'network', 'range', etc.
+            payload (dict): Payload with data to send
             return_fields (list): List of fields to be returned
         Returns:
-            The object reference of the newly create object
+            The object reference of the new creation object
         Raises:
             InfobloxException
         """
@@ -437,7 +501,7 @@ class Connector(object):
         if self.session.cookies:
             # the first 'get' or 'post' action will generate a cookie
             # after that, we don't need to re-authenticate
-            self.session.auth = None
+            self._validate_cookie()
         r = self.session.post(url, **opts)
 
         self._validate_authorized(r)
@@ -468,7 +532,9 @@ class Connector(object):
                 code=resp.status_code)
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def call_func(self, func_name, ref, payload, return_fields=None):
+        self._validate_cookie()
         query_params = self._build_query_params(return_fields=return_fields)
         query_params['_function'] = func_name
 
@@ -493,6 +559,7 @@ class Connector(object):
         return self._parse_reply(r)
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def update_object(self, ref, payload, return_fields=None):
         """Update an Infoblox object
 
@@ -510,6 +577,8 @@ class Connector(object):
         opts = self._get_request_options(data=payload)
         url = self._construct_url(ref, query_params)
         self._log_request('put', url, opts)
+        if self.session.cookies:
+            self._validate_cookie()
         r = self.session.put(url, **opts)
 
         self._validate_authorized(r)
@@ -526,6 +595,7 @@ class Connector(object):
         return self._parse_reply(r)
 
     @reraise_neutron_exception
+    @retry_on_expired_cookie
     def delete_object(self, ref, delete_arguments=None):
         """Remove an Infoblox object
 
@@ -542,6 +612,8 @@ class Connector(object):
             delete_arguments = {}
         url = self._construct_url(ref, query_params=delete_arguments)
         self._log_request('delete', url, opts)
+        if self.session.cookies:
+            self._validate_cookie()
         r = self.session.delete(url, **opts)
 
         self._validate_authorized(r)
