@@ -524,7 +524,12 @@ class TestInfobloxConnector(unittest.TestCase):
         payload = dict(file=data)
         with patch.object(requests.Session, 'post',
                           return_value=mock.Mock()) as patched_post:
-            self.connector.session.cookies = ['cookies']
+            cookie_jar = RequestsCookieJar()
+            cookie_jar.set(
+                'ibapauth',
+                'ctime={},user=admin,group=admin-group,auth=LOCAL,client=API,mtime=1731651582,su=1,ip=localhost,timeout=60,mjuHjy8l1tY0GhSf+aRcxI7rybaIONUIpjc'.format(
+                    int(time.time())), domain='infoblox.localhost')
+            self.connector.session.cookies = cookie_jar
             patched_post.return_value.status_code = 200
             patched_post.return_value.content = '{}'
             self.connector.upload_file(upload_url, payload)
