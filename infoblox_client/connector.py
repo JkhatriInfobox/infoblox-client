@@ -16,6 +16,8 @@
 import functools
 import re
 import urllib
+from traceback import print_tb
+
 import requests
 import six
 import urllib3
@@ -431,10 +433,15 @@ class Connector(object):
     @reraise_neutron_exception
     @retry_on_expired_cookie
     def download_file(self, url):
-        self._validate_cookie()
         if self.session.cookies:
-            self.session.auth = None
-        ibapauth_cookie = self.session.cookies.get('ibapauth')
+            self._validate_cookie()
+            print(self.session.cookies)
+            print(type(self.session.cookies))
+            cookies_dict = self.session.cookies.get_dict()
+            ibapauth_cookie = cookies_dict.get('ibapauth')
+        else:
+            ibapauth_cookie = None
+
         req_cookies = {'ibapauth': ibapauth_cookie}
         headers = {'content-type': 'application/force-download'}
         r = self.session.get(url, headers=headers, cookies=req_cookies)
