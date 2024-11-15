@@ -374,6 +374,7 @@ class Connector(object):
     def download_file(self, url):
         if self.session.cookies:
             self.session.auth = None
+        print(type(self.session.cookies), self.session.cookies)
         ibapauth_cookie = self.session.cookies.get('ibapauth')
         req_cookies = {'ibapauth': ibapauth_cookie}
         headers = {'content-type': 'application/force-download'}
